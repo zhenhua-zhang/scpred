@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # Author:  Zhenhua Zhang
 # E-mail:  zhenhua.zhang217@gmail.com
-# Created: Mar 01, 2022
-# Updated: Apr 11, 2022
+# Created: 2022 Mar 01
+# Updated: 2022 Jun 10
 
-# TODO:
+# NOTE:
 #   1. A configure rule to encode the category variables. Add a function to
 #      encode category variables. Use config.json? Generate a JSON file of the
 #      encoding.
 #   2. Features doesn't match between dataset. Currently the missing features
-#      were assigned to 0.
+#      were assigned to 0, this should be bias.
+#   3. An option to keep features by force to gurentee it's included in the
+#      predictor variables.
 
 import os
 import json
@@ -44,6 +46,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.metrics import recall_score
 from sklearn.metrics import roc_curve
 from sklearn.model_selection import RandomizedSearchCV
+# from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -264,8 +267,8 @@ def get_cli_opts():
                          help="Number of iterations used for the RandomizedSearchCV. Default: %(default)s")
     trn_par.add_argument("-x", "--cv-times", default=10, type=int,
                          help="Number of cross validation. Default: %(default)s")
-    # trn_par.add_argument("-f", "--force-features", default=None, nargs="*",
-    #                      help="Features should be included by force. Default: %(default)s")
+    trn_par.add_argument("-f", "--force-features", default=None, nargs="*",
+                         help="Features should be included by force. Default: %(default)s")
     trn_par.add_argument("-t", "--cell-types", nargs="*", default=None,
                          help="Cell types on which the model will be trained. Default: all")
     trn_par.add_argument("-n", "--n-rows", default=None, type=int,
@@ -380,7 +383,9 @@ def load_expmat(fpath, label_order=None, as_train=True, min_pct=0.2,
         if test_ratio is None or test_ratio <= 0 or not as_train:
             xmat_tn, yvec_tn = xmat, yvec
         else:
-            splits = train_test_split(xmat, yvec, test_size=test_ratio)
+            splits = train_test_split(
+                xmat, yvec, test_size=test_ratio, stratify=yvec
+            )
             xmat_tn, xmat_tt, yvec_tn, yvec_tt = splits
     else:
         xmat_tn = exp_tab
@@ -411,6 +416,7 @@ def ensemble_probs(pred_pc, save_to, **kwargs):
     pe_report = pd.DataFrame(
         columns=["SampleID", "ppval", "theta", "alpha", "beta"]
     )
+
     for pid in pred_pc.loc[:, "SampleID"].unique():
         cur_probs = pred_pc.query(f"SampleID == '{pid}'").loc[:, "y_prob"]
         pe = PredEnsembler(cur_probs, **kwargs)
@@ -424,7 +430,7 @@ def ensemble_probs(pred_pc, save_to, **kwargs):
 
     (pe_report
      .reset_index(drop=True)
-     .to_csv(f"{save_to}/Prediction-persample.csv"))
+     .to_csv(f"{save_to}/Prediction-persample.csv", index=False))
 
 
 def eval_model(xmat, y_true, model, pos_idx=1, cts_map=None, save_to="./"):
@@ -446,7 +452,7 @@ def eval_model(xmat, y_true, model, pos_idx=1, cts_map=None, save_to="./"):
     pred_pc = xmat.assign(
         SampleID=cts_map, y_true=y_true, y_pred=y_pred, y_prob=y_prob
     )
-    pred_pc.to_csv(f"{save_to}/Prediction-percell.csv")
+    pred_pc.to_csv(f"{save_to}/Prediction-percell.csv", index=False)
 
     # Infer expected probability per sample, TODO: put it into a function.
     ensemble_probs(pred_pc, save_to)

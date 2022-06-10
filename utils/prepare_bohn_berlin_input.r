@@ -6,32 +6,30 @@
 
 options(stringsAsFactors = FALSE, error = traceback)
 
-suppressPackageStartupMessages({
-  library(data.table)
-  library(tidyverse)
-  library(magrittr)
-  library(Seurat)
-})
+library(data.table)
+library(tidyverse)
+library(magrittr)
+library(Seurat)
 
 proj_dir <- "~/Documents/projects/wp_codex"
-out_dir <- file.path(proj_dir, "outputs")
 in_dir <- file.path(proj_dir, "inputs")
+out_dir <- file.path(proj_dir, "outputs/expression_matrix")
 
 min_nfeature <- 200
 min_ncount <- 500
-min_mt_pct <- 25
+max_mt_pct <- 25
 
 #
 ## Bohn cohort
 #
 if (TRUE) {
-  bohn_sobj_file <- file.path(
-    in_dir, "scRNA-seq", "seurat_COVID19_PBMC_jonas_FG_2020-07-23.rds"
-  )
+  bohn_sobj_file <- file.path(in_dir, "scRNA-seq", "bohn_harmonized.rds")
   bohn_sobj <- base::readRDS(bohn_sobj_file) %>%
-    subset(subset = min_nfeature <= nFeature_RNA
-           & min_ncount <= nCount_RNA
-           & percent.mito < min_mt_pct)
+    subset(subset = min_nfeature <= nFeature_RNA &
+      min_ncount <= nCount_RNA &
+      percent.mito < max_mt_pct)
+
+  Idents(bohn_sobj) <- "predicted.celltype.l1"
 
   bohn_sobj@meta.data %>%
     colnames() %>%
@@ -128,7 +126,7 @@ if (TRUE) {
 
   # Meta data for all kept cells
   bohn_kept_meta <- c(
-    "age", "sex", "sampleID", "donor", "cluster_labels_res.0.4", "cellbarcodes"
+    "age", "sex", "sampleID", "donor", "predicted.celltype.l1", "cellbarcodes"
   )
   bohn_sub_meta <- bohn_sub_sobj@meta.data %>%
     mutate(cellbarcodes = rownames(.)) %>%
@@ -136,7 +134,7 @@ if (TRUE) {
     rename(
       c(
         "Age" = "age", "Gender" = "sex", "SampleID" = "sampleID",
-        "PatientID" = "donor", "celltypeL0" = "cluster_labels_res.0.4"
+        "PatientID" = "donor", "CellType" = "predicted.celltype.l1"
       )
     )
 
@@ -147,10 +145,10 @@ if (TRUE) {
     as.data.frame() %>%
     mutate(
       cellbarcodes = rownames(.),
-      label = bohn_cmap_per_cell[cellbarcodes]
+      SampleLabel = bohn_cmap_per_cell[cellbarcodes]
     ) %>%
     full_join(bohn_sub_meta, by = "cellbarcodes") %>%
-    relocate(label, .after = last_col()) %>%
+    relocate(SampleLabel, .after = last_col()) %>%
     fwrite(file.path(out_dir, "bohn_covid19_scrna-seq.csv"))
 }
 
@@ -160,11 +158,13 @@ if (TRUE) {
 ## Berlin cohort
 #
 if (TRUE) {
-  berlin_sobj_file <- file.path(in_dir, "scRNA-seq", "cohort1.annote.rds")
+  berlin_sobj_file <- file.path(in_dir, "scRNA-seq", "berlin_harmonized.rds")
   berlin_sobj <- base::readRDS(berlin_sobj_file) %>%
-    subset(subset = min_nfeature <= nFeature_RNA
-           & min_ncount <= nCount_RNA
-           & percent.mt <= min_mt_pct)
+    subset(subset = min_nfeature <= nFeature_RNA &
+      min_ncount <= nCount_RNA &
+      percent.mito < max_mt_pct)
+
+  Idents(berlin_sobj) <- "predicted.celltype.l1"
 
   berlin_sobj@meta.data %>%
     colnames() %>%
@@ -204,11 +204,11 @@ if (TRUE) {
     summarise(
       WHO_Classification = who_per_sample[1],
       sampling_day = paste0(Sampling_date, collapse = ","),
-      sample_id = paste0(sample_id, collapse = ","),
+      # Using the earliest sample as the predictor statement.
+      predictor_var_id = sample_id[1],
       # Using the maximum WHO score as the response variable.
       response_var = max(who_per_sample),
-      # Using the earliest sample as the predictor statement.
-      predictor_var_id = patien_id[1],
+      sample_id = paste0(sample_id, collapse = ","),
     ) %>%
     (function(d) {
       fwrite(d, str_glue("{out_dir}/berlin_sample_info_summary.csv"))
@@ -222,12 +222,12 @@ if (TRUE) {
 
 
   # Cells should be included
-  kept_cells <- berlin_sobj@meta.data %>%
-    filter(patien_id %in% berlin_kept_samples) %>%
+  berlin_kept_cells <- berlin_sobj@meta.data %>%
+    filter(sample_id %in% berlin_kept_samples) %>%
     rownames()
 
   # A summary for all samples.
-  berlin_sample_summary <- berlin_sobj[, kept_cells]@meta.data %>%
+  berlin_sample_summary <- berlin_sobj[, berlin_kept_cells]@meta.data %>%
     group_by(patien_id, sample_id, Gender) %>%
     left_join(berlin_meta, by = "patien_id") %>%
     summarise(n_cells = n(), max_WHO_score = max(who_per_sample)) %>%
@@ -236,7 +236,7 @@ if (TRUE) {
 
   # Here, we only select genes expressed in classical monocytes,
   # but removing MT-, AS (antisense) and ribosomal (RP[LS].*) genes.
-  berlin_kept_genes <- AverageExpression(berlin_sobj[, kept_cells],
+  berlin_kept_genes <- AverageExpression(berlin_sobj[, berlin_kept_cells],
     assays = "RNA", group.by = "celltype"
   ) %>%
     as.data.frame() %>%
@@ -246,7 +246,7 @@ if (TRUE) {
 
 
   # Expression matrix will be used for training.
-  berlin_sub_sobj <- berlin_sobj[berlin_kept_genes, kept_cells]
+  berlin_sub_sobj <- berlin_sobj[berlin_kept_genes, berlin_kept_cells]
 
   # Condition map
   berlin_cmap_per_donor <- berlin_sample_summary %>%
@@ -262,19 +262,23 @@ if (TRUE) {
       cellbarcodes = rownames(.),
       worst_condition = berlin_cmap_per_donor[patien_id]
     ) %>%
-    filter(patien_id %in% berlin_kept_samples) %>%
+    filter(sample_id %in% berlin_kept_samples) %>%
     select(cellbarcodes, worst_condition) %>%
     deframe()
 
 
   # Meta data for all kept cells
   berlin_kept_meta <- c(
-    "Age", "Gender", "sample_id", "patien_id", "cellbarcodes", "celltypeL0"
+    "Age", "Gender", "sample_id", "patien_id", "cellbarcodes",
+    "predicted.celltype.l1"
   )
   berlin_sub_meta <- berlin_sub_sobj@meta.data %>%
     mutate(cellbarcodes = rownames(.)) %>%
     select(one_of(berlin_kept_meta)) %>%
-    rename(c("SampleID" = "sample_id", "PatientID" = "patien_id"))
+    rename(c(
+      "SampleID" = "sample_id", "PatientID" = "patien_id",
+      "CellType" = "predicted.celltype.l1"
+    ))
 
   # Expression matrix for training.
   berlin_sub_sobj@assays$RNA@data %>%
@@ -283,10 +287,64 @@ if (TRUE) {
     as.data.frame() %>%
     mutate(
       cellbarcodes = rownames(.),
-      label = berlin_cmap_per_cell[cellbarcodes]
+      SampleLabel = berlin_cmap_per_cell[cellbarcodes]
     ) %>%
     mutate(across(where(is.numeric), ~ round(.x, digits = 4))) %>%
     full_join(berlin_sub_meta, by = "cellbarcodes") %>%
-    relocate(label, .after = last_col()) %>%
+    relocate(SampleLabel, .after = last_col()) %>%
     fwrite(file.path(out_dir, "berlin_covid19_scrna-seq.csv"))
+}
+
+
+if (TRUE) {
+  mhh50_sobj_file <- file.path(in_dir, "scRNA-seq/pbmc.filter.annotev5.rds")
+  mhh50_sobj <- readRDS(mhh50_sobj_file) %>%
+    subset(subset = min_nfeature <= nFeature_RNA &
+      min_ncount <= nCount_RNA &
+      percent.mt <= max_mt_pct) # TODO: check the name of MT gene percent
+
+  tar_cols <- c(
+    "SampleID", "patient", "gender", "Age", "Days.post.convalescent",
+    "WHO_score", "Severity"
+  )
+
+  force_save <- TRUE
+  sample_info <- mhh50_sobj@meta.data %>%
+    select(one_of(tar_cols)) %>%
+    unique() %>%
+    group_by(patient, gender, Age) %>%
+    arrange(Days.post.convalescent) %>%
+    filter(n() > 1) %>%
+    (function(e) {
+      g <- e %>%
+        mutate(patient = as.factor(patient)) %>%
+        ggplot(aes(
+          x = Days.post.convalescent, y = patient, color = gender,
+          label = WHO_score
+        )) +
+        geom_label(alpha = 0.5) +
+        geom_vline(xintercept = 0, linetype = "dashed") +
+        theme_classic()
+
+      save_to <- str_glue("{out_dir}/mhh50_sample_info_summary.pdf")
+      if (!file.exists(save_to) || force_save) {
+        ggsave(save_to, plot = g)
+      }
+
+      return(e)
+    }) %>%
+    summarise(
+      sample_id = paste(SampleID, collapse = ","),
+      sampling_days = paste(Days.post.convalescent, collapse = ","),
+      WHO_score = paste(WHO_score, collapse = ","),
+      severity = paste(Severity, collapse = ",")
+    ) %>%
+    (function(dtfm) {
+      save_to <- str_glue("{out_dir}/mhh50_sample_info_summary.csv")
+      if (!file.exists(save_to) || force_save) {
+        fwrite(dtfm, save_to)
+      }
+
+      return(dtfm)
+    })
 }
