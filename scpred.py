@@ -20,37 +20,44 @@ import argparse
 
 from datetime import datetime as dt
 
-import shap
-import pyro
-import torch
-
 import matplotlib.pyplot as plt
 import joblib as jbl
 import pickle as pkl
 import pandas as pd
 import numpy as np
+import shap as sp
 
-import pyro.distributions.constraints as const
-import pyro.distributions as dist
-import pyro.infer as infer
-import pyro.optim as optim
+import torch
+import torch.nn as tc_nn
+import torch.nn.functional as tc_func
+import torch.optim as tc_optim
+
+from torch.utils.data.dataloader import Dataset as tc_Dataset
+from torch.utils.data.dataloader import DataLoader as tc_DataLoader
+
+import pyro
+import pyro.distributions.constraints as pr_const
+import pyro.distributions as pr_dist
+import pyro.infer as pr_infer
+import pyro.optim as pr_optim
 
 from sklearn.base import BaseEstimator
+from sklearn.base import ClassifierMixin
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.feature_selection import SelectPercentile
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectKBest
 from sklearn.feature_selection import f_classif
+from sklearn.metrics import accuracy_score
 from sklearn.metrics import precision_recall_curve
 from sklearn.metrics import precision_score
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import roc_auc_score
 from sklearn.metrics import recall_score
+from sklearn.metrics import roc_auc_score
 from sklearn.metrics import roc_curve
 from sklearn.model_selection import RandomizedSearchCV
-# from sklearn.model_selection import GridSearchCV
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
 
 
 class LogManager(logging.Logger):
@@ -73,7 +80,122 @@ class LogManager(logging.Logger):
         self.addHandler(hdl)
 
 
+class ExpDataSet(tc_Dataset):
+    def __init__(self, X, y=None):
+        super(ExpDataSet, self).__init__()
+        self.x_mat = X
+        self.y_vec = y
+
+    def __len__(self):
+        return self.x_mat.shape[0]
+
+    def __getitem__(self, idx: int):
+        x_vec = torch.Tensor(self.x_mat[idx, :]).unsqueeze(0)
+
+        if self.y_vec is None:
+            y_vec = torch.tensor(torch.nan)
+        else:
+            y_vec = torch.tensor(self.y_vec[idx])
+
+        return x_vec, y_vec
+
+    def __next__(self):
+        for x in range(len(self)):
+            yield self[x]
+
+
+class ScCNN(tc_nn.Module):
+    def __init__(self, fs: int = 32, cs: int = 2):
+        super(ScCNN, self).__init__()
+
+        assert fs % 2 == 0, "The fully-connected input size should be even."
+
+        self.cv1 = tc_nn.Conv1d(1, 4, 3)
+        self.cv2 = tc_nn.Conv1d(4, 8, 3)
+        self.dp1 = tc_nn.Dropout(0.25)
+        self.mp1 = tc_nn.MaxPool1d(2)
+        self.fc1 = tc_nn.Linear(fs * 4 - 16, cs)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        x = tc_func.relu(x)
+
+        x = self.cv2(x)
+        x = tc_func.relu(x)
+
+        x = self.mp1(x)
+        x = self.dp1(x)
+
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = tc_func.relu(x)
+
+        out = tc_func.softmax(x, dim=1)
+        return out
+
+
+class NNClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(self, learning_rate: float = 1e-5, neps: int = 100):
+        super(NNClassifier, self).__init__()
+
+        self.model = None
+        self.learning_rate = learning_rate
+
+        self.neps = neps
+
+    @property
+    def loss_func(self):
+        return tc_nn.CrossEntropyLoss()
+
+    @property
+    def optimizer(self):
+        return tc_optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+    def fit(self, X, y, batch_size: int = 32, shuffle=True):
+        nr_features = X.shape[1]
+        self.model = ScCNN(nr_features)
+
+        dtld = tc_DataLoader(
+            ExpDataSet(X, y), batch_size=batch_size, shuffle=shuffle
+        )
+
+        for bt_idx, (x_mat, y_true) in enumerate(dtld):
+            y_pred = self.model(x_mat)
+            y_true = y_true.type(torch.LongTensor)
+            loss = self.loss_func(y_pred, y_true)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+        return self
+
+    def predict(self, X, pos_idx: int = 0, use_prob=False):
+        dtld = tc_DataLoader(ExpDataSet(X), batch_size=1, shuffle=False)
+
+        y_pprob, y_plabel = torch.Tensor(), torch.Tensor()
+
+        if self.model is None:
+            raise ValueError("Model wasn't ready yet, please use fit() first.")
+
+        with torch.no_grad():
+            for idx, (x_test, _) in enumerate(dtld):
+                y_pred = self.model(x_test)
+
+                y_pprob = torch.concat((y_pprob, y_pred[:, pos_idx]))
+                y_plabel = torch.concat((y_plabel, y_pred.argmax(1)))
+
+            if use_prob:
+                return y_pprob.data.item()
+            else:
+                return y_plabel.data.numpy().astype("i8")
+
+    def predict_proba(self, X, pos_idx: int = 0):
+        return self.predict(X, pos_idx, True)
+
+
 class PredEnsembler:
+    """A class to ensemble the predicted probabilities."""
     def __init__(self, data, n_iters=5000,
                  logman: LogManager = LogManager("PredEnsembler")):
         self._logman = logman
@@ -106,22 +228,22 @@ class PredEnsembler:
             data = torch.Tensor(data)
 
         a_init, b_init = torch.tensor([5, 5])
-        alpha = pyro.param("alpha", a_init, constraint=const.positive)
-        beta = pyro.param("beta", b_init, constraint=const.positive)
+        alpha = pyro.param("alpha", a_init, constraint=pr_const.positive)
+        beta = pyro.param("beta", b_init, constraint=pr_const.positive)
 
         with pyro.plate("obs", len(data)):
-            return pyro.sample("theta", dist.Beta(alpha, beta), obs=data)
+            return pyro.sample("theta", pr_dist.Beta(alpha, beta), obs=data)
 
     def infer(self, adam_param={"lr": 1e-3}):
         """Infer theta from given"""
         # The guide function
-        self._guide = infer.autoguide.AutoNormal(self._model)
+        self._guide = pr_infer.autoguide.AutoNormal(self._model)
 
-        adam = optim.Adam(adam_param) # Optimizer
-        elbo = infer.Trace_ELBO() # Trace by ELBO (evidence lower bound)
+        adam = pr_optim.Adam(adam_param) # Optimizer
+        elbo = pr_infer.Trace_ELBO() # Trace by ELBO (evidence lower bound)
 
         # Stochastic Variational Inference
-        svi = infer.SVI(self._model, self._guide, adam, elbo)
+        svi = pr_infer.SVI(self._model, self._guide, adam, elbo)
 
         # Sampling
         for _ in range(self._n_iters):
@@ -137,7 +259,7 @@ class PredEnsembler:
         self._theta = [a / (a + b) for a, b in zip(self._alpha, self._beta)]
     
     def cdf(self, x=0.5, n_points=10000): # Cumulative density/mass function
-        beta = dist.Beta(self.alpha, self.beta)
+        beta = pr_dist.Beta(self.alpha, self.beta)
         x_space = torch.linspace(0, x, n_points)[1:-1]
         return torch.trapz(beta.log_prob(x_space).exp(), x_space)
 
@@ -158,7 +280,7 @@ class PredEnsembler:
         ax_mean_lf.set_title(f"$PP_{{{pp}}}$ = {self._pp_val:.2f}%")
 
         ## Sampling using the learned parameters
-        pd_vi = dist.Beta(self.alpha, self.beta)
+        pd_vi = pr_dist.Beta(self.alpha, self.beta)
         x_values = np.linspace(0, 1, num=1000)[1:-1]
         y_values = torch.exp(pd_vi.log_prob(torch.tensor(x_values)))
 
@@ -238,12 +360,6 @@ class CategoryEncoder(BaseEstimator):
         self.fit(X, y)
         return self.transform(X)
 
-    def get_params(self, deep=True):
-        return {}
-
-    def set_params(self, **params):
-        return self
-
 
 def get_cli_opts():
     par = argparse.ArgumentParser()
@@ -252,7 +368,7 @@ def get_cli_opts():
     par.add_argument("-P", "--proj-dir", default="Scpred",
                      help="The project dir containing train, explain, and predict results. Default: %(default)s")
 
-    subpar = par.add_subparsers(dest="subcmd")
+    subpar = par.add_subparsers(dest="subcmd", required=True)
 
     trn_par = subpar.add_parser("train", help="Train a model from expression data.")
     trn_par.add_argument("-i", "--in-file", required=True,
@@ -271,6 +387,8 @@ def get_cli_opts():
                          help="Features should be included by force. Default: %(default)s")
     trn_par.add_argument("-t", "--cell-types", nargs="*", default=None,
                          help="Cell types on which the model will be trained. Default: all")
+    trn_par.add_argument("-m", "--model-arch", choices=["gbc", "nn"], default="gbc",
+                         help="Which model architecture to be used. Default: %(default)s")
     trn_par.add_argument("-n", "--n-rows", default=None, type=int,
                          help="Number of rows to be read from the training in-file. Default: all")
     trn_par.add_argument("-@", "--n-jobs", default=1, type=int,
@@ -513,6 +631,7 @@ def train(options, logman: LogManager = LogManager("Train")):
     n_iters = options.n_iters
     n_jobs = options.n_jobs
     n_rows = options.n_rows
+    model_arch = options.model_arch
 
     # IO
     save_to = f"{proj_dir}/Train"
@@ -521,17 +640,27 @@ def train(options, logman: LogManager = LogManager("Train")):
     pos_lab, lab_order, param_space = parse_config(options.config)
     pos_idx = lab_order.index(pos_lab)
 
-    # A pipeline for scaling data, selecting features, classifying samples.
-    pipe = Pipeline(steps=[("encode", CategoryEncoder()),
-                           ("scale", StandardScaler()),
-                           ("select", SelectPercentile(f_classif)),
-                           ("classify", GradientBoostingClassifier())])
-
     # Load expression matrix
     x_tn, x_tt, y_tn, y_tt, cts_map = load_expmat(
         in_file, lab_order, test_ratio=test_ratio, index_col=bcode_col,
         cell_types=cell_types, nrows=n_rows
     )
+
+    # A pipeline for scaling data, selecting features, classifying samples.
+    pipe_steps = [("encode", CategoryEncoder()),
+                  ("scale", StandardScaler()),
+                  ("select", SelectKBest(f_classif))]
+
+    if model_arch == "nn":
+        pipe_steps.append(("classify", NNClassifier()))
+    elif model_arch == "rfc":
+        pipe_steps.append(("classify", RandomForestClassifier()))
+    else:
+        if model_arch != "gbc":
+            logman.warning(f"Unsupported {model_arch}, using gbc by default.")
+        pipe_steps.append(("classify", GradientBoostingClassifier()))
+
+    pipe = Pipeline(steps=pipe_steps)
 
     # Searching the best hyper-parameters randomly.
     rscv = RandomizedSearchCV(
@@ -583,13 +712,13 @@ def explain(options, logman: LogManager = LogManager("Explain")):
 
     # Plot SHAP values. Including bar and dot (beeswarm) plot
     pbe, xmat = pipe_last_step(model, xmat)
-    explainer = shap.TreeExplainer(pbe)
+    explainer = sp.TreeExplainer(pbe)
     shap_vals = explainer(xmat)
 
     for ptype in ["dot", "bar"]:
         plt.clf() # We clear the figure.
 
-        shap.summary_plot(shap_vals, plot_type=ptype, show=False)
+        sp.summary_plot(shap_vals, plot_type=ptype, show=False)
         fig = plt.gcf()
         if ptype == "dot":
             _, axe_cb = fig.get_axes()
